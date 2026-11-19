@@ -27,13 +27,20 @@ import hmac
 import json
 import os
 import sys
+from pathlib import Path
 
-from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+# On Azure Functions the deploy installs packages into .python_packages, which
+# a plain `python server.py` doesn't search. Add it before importing them.
+_PACKAGES = Path(__file__).resolve().parent / ".python_packages" / "lib" / "site-packages"
+if _PACKAGES.is_dir():
+    sys.path.insert(0, str(_PACKAGES))
 
-from sources import SOURCES, at_realtime
+from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+from starlette.requests import Request  # noqa: E402
+from starlette.responses import JSONResponse  # noqa: E402
+
+from sources import SOURCES, at_realtime  # noqa: E402
 
 # Must match "port" in host.json. Don't read PORT: Azure sets that for its own use.
 PORT = int(os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT") or os.getenv("MCP_PORT") or "8000")

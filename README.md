@@ -53,6 +53,7 @@ Function App `rit-mcp`, Flex Consumption, Python 3.12 or 3.13, resource group `R
    | --- | --- |
    | `APP_API_TOKEN` | Random string, 32+ characters. Clients send it as a bearer token. |
    | `AzureWebJobsFeatureFlags` | `EnableMcpCustomHandlerPreview` |
+   | `PYTHONPATH` | `/home/site/wwwroot/.python_packages/lib/site-packages` |
 
    Optional: `AT_STORAGE_ACCOUNT`, `AT_CONTAINER` (defaults `ritadlsdevpublic`, `aucklandtransport`).
 4. **Deploy:** in VS Code, Azure Functions extension > Deploy to Function App > `rit-mcp`. Functions installs `requirements.txt` during the deploy.
