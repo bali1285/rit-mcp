@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -152,6 +153,15 @@ def _gtfs_routes() -> pa.Table:
     return table
 
 
+# A minute snapshot: .../YYYY/MM/DD/HH/combinefeed_MMSS.parquet. Anything else
+# in those folders (daily rollups, folder markers) is ignored.
+SNAPSHOT_RE = re.compile(r"/\d{4}/\d{2}/\d{2}/\d{2}/[^/]*_\d{4}\.parquet$")
+
+
+def _snapshot_names(prefix: str) -> list[str]:
+    return [n for n in _list(prefix) if SNAPSHOT_RE.search(n)]
+
+
 def _snapshot_time(name: str) -> datetime:
     """combinefeed/2026/11/19/13/combinefeed_0100.parquet -> 2026-11-19 13:01:00 NZ."""
     parts = name.split("/")
@@ -168,7 +178,7 @@ def _latest_name() -> str:
     """Newest snapshot, looking back up to 3 hours."""
     now = datetime.now(TZ)
     for back in range(4):
-        names = _list(_hour_prefix(now - timedelta(hours=back)))
+        names = _snapshot_names(_hour_prefix(now - timedelta(hours=back)))
         if names:
             return names[-1]
     raise RuntimeError("No snapshots found in the last 3 hours.")
@@ -177,7 +187,7 @@ def _latest_name() -> str:
 def _day_names(day: str | None, every_minutes: int) -> list[str]:
     """Snapshots for one Auckland day, thinned to one every N minutes."""
     d = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=TZ) if day else datetime.now(TZ)
-    names = _list(f"{FEED_PREFIX}/{d:%Y/%m/%d}/")
+    names = _snapshot_names(f"{FEED_PREFIX}/{d:%Y/%m/%d}/")
     every = max(1, every_minutes)
     picked, last_slot = [], None
     for n in names:
