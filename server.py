@@ -46,7 +46,7 @@ from sources import SOURCES, at_realtime  # noqa: E402
 PORT = int(os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT") or os.getenv("MCP_PORT") or "8000")
 APP_API_TOKEN = os.getenv("APP_API_TOKEN", "")
 REQUIRE_TOKEN = os.getenv("REQUIRE_TOKEN", "true").lower() != "false"
-PUBLIC_ORIGIN = os.getenv("PUBLIC_ORIGIN", "")  # optional exact https origin for browser clients
+PUBLIC_ORIGIN = os.getenv("PUBLIC_ORIGIN", "")  # optional: if set, browser requests must come from this exact origin
 
 mcp = MCPServer(
     name="rit-mcp",
@@ -81,9 +81,13 @@ class TokenGuard:
         if len(APP_API_TOKEN) < 32:
             return await self._reply(send, 503, "Server token not configured (APP_API_TOKEN, 32+ chars).")
         origin = headers.get("origin")
-        if origin is not None and origin != PUBLIC_ORIGIN:
+        if PUBLIC_ORIGIN and origin is not None and origin != PUBLIC_ORIGIN:
+            print(f"rit-mcp: refused, origin {origin!r} not allowed", flush=True)
             return await self._reply(send, 403, "Origin not allowed.")
-        if not hmac.compare_digest(headers.get("authorization", ""), f"Bearer {APP_API_TOKEN}"):
+        auth = headers.get("authorization", "")
+        if not hmac.compare_digest(auth, f"Bearer {APP_API_TOKEN}"):
+            shape = "missing" if not auth else ("no 'Bearer ' prefix" if not auth.startswith("Bearer ") else "wrong token")
+            print(f"rit-mcp: refused {scope.get('method')} {scope['path']}, authorization {shape}", flush=True)
             return await self._reply(send, 401, "Missing or wrong bearer token.")
         return await self.app(scope, receive, send)
 
