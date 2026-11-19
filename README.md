@@ -81,7 +81,7 @@ python server.py --describe     # checks the feed and GTFS load
 ```
 
 Then either `func start` (uses `local.settings.json`, serves on port 7071) or
-`python server.py` (port 8000, set `APP_API_TOKEN` first). The `rit-mcp-local`
+`python server.py` (port 8000, or set `MCP_PORT`; set `APP_API_TOKEN` first). The `rit-mcp-local`
 entry in `.vscode/mcp.json` points at `func start`.
 
 ## Adding a source

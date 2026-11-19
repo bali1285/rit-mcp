@@ -35,7 +35,8 @@ from starlette.responses import JSONResponse
 
 from sources import SOURCES, at_realtime
 
-PORT = int(os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT") or os.getenv("PORT", "8000"))
+# Must match "port" in host.json. Don't read PORT: Azure sets that for its own use.
+PORT = int(os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT") or os.getenv("MCP_PORT") or "8000")
 APP_API_TOKEN = os.getenv("APP_API_TOKEN", "")
 REQUIRE_TOKEN = os.getenv("REQUIRE_TOKEN", "true").lower() != "false"
 PUBLIC_ORIGIN = os.getenv("PUBLIC_ORIGIN", "")  # optional exact https origin for browser clients
@@ -110,6 +111,7 @@ def main() -> None:
         return
     import uvicorn
 
+    print(f"rit-mcp starting on port {PORT}", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 
