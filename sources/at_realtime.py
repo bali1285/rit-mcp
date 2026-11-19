@@ -12,6 +12,7 @@ All tools are registered with an `at_` prefix by `register()`.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -199,9 +200,13 @@ def _load(names: list[str]) -> pa.Table:
         tables = list(pool.map(_read, names))
     tagged = []
     for name, t in zip(names, tables):
+        # Snapshots don't always agree on column types (a column that's empty in
+        # one file can come through as a different type). Everything is cleaned
+        # and typed in the feed view anyway, so read every column as text.
+        t = pa.table({c: _str_col(t, c) for c in t.column_names})
         ts = _snapshot_time(name).isoformat(timespec="seconds")
         tagged.append(t.append_column("_snapshot", pa.array([ts] * t.num_rows, pa.string())))
-    return pa.concat_tables(tagged, promote_options="permissive")
+    return pa.concat_tables(tagged, promote_options="default")
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +627,274 @@ def query_feed(sql: str, scope: str = "latest", every_minutes: int = 15, max_row
 
 
 # ---------------------------------------------------------------------------
+# History: the daily combined files (one row per trip per service day)
+#
+#   combinefeed/YYYY/MM/trip_updates_DD.parquet   written the next morning
+#
+# Each row is a trip's last known state that day: final delay, last stop,
+# cancelled or not. A month is about 30 files of ~1 MB, so date ranges are
+# cheap. Today isn't there yet: use the realtime at_ tools for today.
+# ---------------------------------------------------------------------------
+
+MAX_HISTORY_DAYS = int(os.getenv("MAX_HISTORY_DAYS", "400"))
+
+TRIP_COLUMNS = [
+    "trip_update_trip_trip_id", "trip_update_trip_start_time", "trip_update_trip_start_date",
+    "trip_update_trip_schedule_relationship", "trip_update_trip_route_id", "trip_update_trip_direction_id",
+    "trip_update_stop_time_update_stop_sequence", "trip_update_stop_time_update_stop_id",
+    "trip_update_stop_time_update_departure_delay", "trip_update_stop_time_update_arrival_delay",
+    "trip_update_delay", "trip_update_vehicle_id", "trip_update_vehicle_label", "trip_update_timestamp",
+]
+
+_stops_cache: dict = {"loaded": 0.0, "table": None, "source": None}
+_STOPS_EMPTY = pa.table({c: pa.array([], pa.string()) for c in ["stop_id", "stop_name", "stop_lat", "stop_lon"]})
+
+
+def _gtfs_stops() -> pa.Table:
+    """Static GTFS stops (newest dated at_gtfs_stops_ file), cached like routes."""
+    if _stops_cache["table"] is not None and time.time() - _stops_cache["loaded"] < GTFS_REFRESH_S:
+        return _stops_cache["table"]
+    table, source = _STOPS_EMPTY, None
+    try:
+        names = _list(GTFS_PREFIX)
+        dated = sorted(n for n in names if Path(n).name.startswith("at_gtfs_stops_"))
+        name = dated[-1] if dated else next((n for n in names if Path(n).name == "stops.parquet"), None)
+        if name:
+            s = _read_any(name)
+            table = pa.table({c: _str_col(s, c) for c in ["stop_id", "stop_name", "stop_lat", "stop_lon"]})
+            source = name
+    except Exception:
+        logging.exception("Could not load GTFS stops from %s", GTFS_PREFIX)
+    _stops_cache.update(loaded=time.time(), table=table, source=source)
+    return table
+
+
+def _history_names(start_date: str, end_date: str | None) -> list[tuple[str, str]]:
+    """(service_date, blob name) for each daily trip_updates file in the range."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else start
+    if end < start:
+        raise ToolError("end_date is before start_date.")
+    if (end - start).days + 1 > MAX_HISTORY_DAYS:
+        raise ToolError(f"That's more than {MAX_HISTORY_DAYS} days. Use a shorter range.")
+    picked, months = [], {}
+    day = start
+    while day <= end:
+        prefix = f"{FEED_PREFIX}/{day:%Y/%m}/"
+        if prefix not in months:  # one listing per month, not per day
+            months[prefix] = set(_list(prefix))
+        name = f"{prefix}trip_updates_{day:%d}.parquet"
+        if name in months[prefix]:
+            picked.append((day.isoformat(), name))
+        day += timedelta(days=1)
+    return picked
+
+
+def _load_history(pairs: list[tuple[str, str]]) -> pa.Table:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tables = list(pool.map(_read, [n for _, n in pairs]))
+    parts = []
+    for (service_date, _), t in zip(pairs, tables):
+        cols = {c: _str_col(t, c) for c in TRIP_COLUMNS}
+        cols["service_date"] = pa.array([service_date] * t.num_rows, pa.string())
+        parts.append(pa.table(cols))
+    if not parts:
+        return pa.table({c: pa.array([], pa.string()) for c in TRIP_COLUMNS + ["service_date"]})
+    return pa.concat_tables(parts)
+
+
+TRIPS_SQL = r"""
+CREATE MACRO nz(x) AS nullif(nullif(trim(CAST(x AS VARCHAR)), 'nan'), '');
+CREATE MACRO num(x) AS TRY_CAST(nz(x) AS DOUBLE);
+
+-- Approximate area from a stop's position. Rough boxes, good enough to
+-- compare parts of Auckland, not to draw boundaries.
+CREATE MACRO area_of(lat, lon) AS CASE
+    WHEN lat IS NULL OR lon IS NULL THEN NULL
+    WHEN lon > 174.95 AND lat > -36.90 THEN 'Islands'
+    WHEN lat > -36.40 THEN 'Far North'
+    WHEN lon < 174.69 THEN 'West'
+    WHEN lat > -36.835 THEN 'North Shore'
+    WHEN lat < -37.10 THEN 'Far South'
+    WHEN lat < -36.93 THEN 'South'
+    WHEN lon > 174.83 THEN 'East'
+    ELSE 'Central' END;
+
+CREATE VIEW trips_raw AS
+SELECT
+    CAST(service_date AS DATE) AS service_date,
+    nz(trip_update_trip_trip_id) AS trip_id,
+    nz(trip_update_trip_route_id) AS route_id,
+    CAST(num(trip_update_trip_direction_id) AS INTEGER) AS direction_id,
+    nz(trip_update_trip_start_date) AS start_date,
+    nz(trip_update_trip_start_time) AS start_time,
+    CAST(num(trip_update_trip_schedule_relationship) AS INTEGER) = 3 AS cancelled,
+    coalesce(num(trip_update_delay), num(trip_update_stop_time_update_departure_delay),
+             num(trip_update_stop_time_update_arrival_delay)) AS delay_s,
+    nz(trip_update_stop_time_update_stop_id) AS last_stop_id,
+    CAST(num(trip_update_stop_time_update_stop_sequence) AS INTEGER) AS last_stop_sequence,
+    nz(trip_update_vehicle_id) AS vehicle_id,
+    regexp_replace(nz(trip_update_vehicle_label), '\s+', ' ', 'g') AS vehicle_label,
+    nullif(regexp_extract(nz(trip_update_vehicle_label), '^([A-Z]{2,4})\s*\d+$', 1), '') AS fleet_code,
+    CAST(num(trip_update_timestamp) AS BIGINT) AS event_epoch
+FROM raw_trips
+WHERE nz(trip_update_trip_trip_id) IS NOT NULL;
+
+-- The daily file can hold a trip twice: keep its latest update.
+CREATE VIEW trips_dedup AS
+SELECT * FROM trips_raw
+QUALIFY row_number() OVER (PARTITION BY service_date, trip_id ORDER BY event_epoch DESC NULLS LAST) = 1;
+
+CREATE VIEW gtfs_by_short AS
+SELECT route_short_name, any_value(agency_id) AS agency_id, any_value(agency_name) AS agency_name,
+       any_value(route_type) AS route_type
+FROM gtfs_routes WHERE route_short_name IS NOT NULL
+GROUP BY route_short_name HAVING count(DISTINCT agency_id) = 1;
+
+CREATE VIEW trips AS
+SELECT t.*,
+       split_part(t.route_id, '-', 1) AS route_short_name,
+       coalesce(g.agency_name, gs.agency_name, o.name, t.fleet_code) AS operator,
+       coalesce(g.agency_id, gs.agency_id, t.fleet_code) AS operator_code,
+       CASE CAST(TRY_CAST(coalesce(g.route_type, gs.route_type) AS DOUBLE) AS INTEGER)
+            WHEN 0 THEN 'tram' WHEN 1 THEN 'metro' WHEN 2 THEN 'rail' WHEN 3 THEN 'bus'
+            WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode,
+       s.stop_name AS last_stop_name,
+       area_of(TRY_CAST(s.stop_lat AS DOUBLE), TRY_CAST(s.stop_lon AS DOUBLE)) AS area,
+       CASE WHEN t.cancelled THEN 'cancelled'
+            WHEN t.delay_s IS NULL THEN 'unknown'
+            WHEN t.delay_s > ? * 60 THEN 'late'
+            WHEN t.delay_s < -? * 60 THEN 'early'
+            ELSE 'on time' END AS outcome
+FROM trips_dedup t
+LEFT JOIN gtfs_routes g ON g.route_id = t.route_id
+LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = split_part(t.route_id, '-', 1)
+LEFT JOIN operators o ON o.code = t.fleet_code
+LEFT JOIN gtfs_stops s ON s.stop_id = t.last_stop_id;
+"""
+
+TRIPS_COLUMNS_HELP = """\
+trips: one row per trip per service day, from the daily files (yesterday and earlier).
+  service_date    DATE         the day the file covers
+  trip_id, route_id, route_short_name, direction_id, start_date, start_time
+  cancelled       BOOLEAN
+  delay_s         final known delay in seconds, positive = late
+  outcome         'on time' | 'late' | 'early' | 'cancelled' | 'unknown'
+                  (late = more than ON_TIME_LATE_MIN late, early = more than ON_TIME_EARLY_MIN early)
+                  Delay is at the trip's last reported stop, usually near the end of the route,
+                  where arriving early is normal. Treat 'early' as not late, not as a failure.
+  operator, operator_code, mode (bus | rail | ferry ...)
+  area            approximate, from the last stop's position: Central, North Shore, West,
+                  East, South, Far South, Far North, Islands (NULL for cancelled trips)
+  last_stop_id, last_stop_name, last_stop_sequence, vehicle_id, vehicle_label, fleet_code
+Notes: percentages should use trips with a known outcome; cancelled trips have no area."""
+
+
+def _connect_history(table: pa.Table) -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute("SET threads = 4")
+    con.execute(f"SET memory_limit = '{os.getenv('DUCKDB_MEMORY_LIMIT', '1GB')}'")
+    con.register("raw_trips", table)
+    con.register("operators", pa.table({"code": list(FLEET_OPERATORS), "name": list(FLEET_OPERATORS.values())}))
+    con.register("gtfs_routes", _gtfs_routes())
+    con.register("gtfs_stops", _gtfs_stops())
+    # The thresholds are baked into the view so every query uses the same definition.
+    sql = TRIPS_SQL.replace("? * 60 THEN 'late'", f"{float(LATE_LIMIT_MIN)} * 60 THEN 'late'")
+    sql = sql.replace("-? * 60 THEN 'early'", f"-{float(EARLY_LIMIT_MIN)} * 60 THEN 'early'")
+    con.execute(sql)
+    con.execute("SET enable_external_access = false")
+    con.execute("SET lock_configuration = true")
+    return con
+
+
+GROUPINGS = {
+    "operator": "operator",
+    "area": "area",
+    "operator_area": "operator, area",
+    "route": "route_short_name, operator",
+    "day": "service_date",
+    "operator_day": "operator, service_date",
+    "mode": "mode",
+}
+
+
+def performance(start_date: str, end_date: str | None = None, group_by: str = "operator",
+                operator: str | None = None, route: str | None = None, area: str | None = None,
+                limit: int = 100) -> dict:
+    """Punctuality and cancellations over a date range from the daily files
+    (YYYY-MM-DD; yesterday and earlier, today isn't combined yet). group_by:
+    operator, area, operator_area, route, day, operator_day or mode. Returns
+    trips, cancelled %, late %, on-time %, early % and median delay for each
+    group. Delay is measured at each trip's last reported stop, usually near
+    the end of the route, where arriving early is normal: on_time_pct counts
+    every trip that wasn't late, early_pct is shown for info only. Late,
+    on-time and early % are of trips that ran and reported a delay. Filters:
+    operator (code or part of a name), route ('NX1'), area ('North Shore')."""
+    if group_by not in GROUPINGS:
+        raise ToolError(f"group_by must be one of: {', '.join(GROUPINGS)}")
+    pairs = _history_names(start_date, end_date)
+    if not pairs:
+        return {"start_date": start_date, "end_date": end_date or start_date, "days_read": 0, "rows": []}
+    con = _connect_history(_load_history(pairs))
+    keys = GROUPINGS[group_by]
+    rows = _rows(
+        con,
+        f"""
+        SELECT {keys},
+               count(*) AS trips,
+               count(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
+               round(100.0 * count(*) FILTER (WHERE outcome = 'cancelled') / count(*), 1) AS cancelled_pct,
+               count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')) AS measured,
+               round(100.0 * count(*) FILTER (WHERE outcome = 'late')
+                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS late_pct,
+               round(100.0 * count(*) FILTER (WHERE outcome IN ('on time', 'early'))
+                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS on_time_pct,
+               round(100.0 * count(*) FILTER (WHERE outcome = 'early')
+                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS early_pct,
+               round(median(delay_s) FILTER (WHERE NOT cancelled) / 60.0, 1) AS median_delay_minutes
+        FROM trips
+        WHERE {ROUTE_FILTER}
+          AND (? IS NULL OR operator_code ILIKE ? OR operator ILIKE '%' || ? || '%')
+          AND (? IS NULL OR area ILIKE ?)
+        GROUP BY {keys}
+        ORDER BY {'service_date' if group_by == 'day' else 'trips DESC'}
+        LIMIT ?
+        """,
+        _route_params(route) + [operator, operator, operator, area, area, max(1, min(limit, 1000))],
+    )
+    return {"start_date": pairs[0][0], "end_date": pairs[-1][0], "days_read": len(pairs),
+            "days_missing": ((datetime.strptime(end_date or start_date, "%Y-%m-%d").date()
+                              - datetime.strptime(start_date, "%Y-%m-%d").date()).days + 1 - len(pairs)),
+            "thresholds_minutes": {"late_over": LATE_LIMIT_MIN, "early_over": EARLY_LIMIT_MIN},
+            "group_by": group_by, "rows": rows}
+
+
+def query_history(sql: str, start_date: str, end_date: str | None = None, max_rows: int = 500) -> dict:
+    """Run your own read-only SQL (DuckDB dialect) against the `trips` view
+    (one row per trip per day, from the daily files) for a date range
+    (YYYY-MM-DD, yesterday and earlier). Only a single SELECT or WITH query.
+    Columns are in the server instructions."""
+    text = sql.strip().rstrip(";").strip()
+    if ";" in text or not text.lower().startswith(("select", "with")):
+        raise ToolError("Only one SELECT or WITH query is allowed.")
+    pairs = _history_names(start_date, end_date)
+    if not pairs:
+        return {"days_read": 0, "rows": []}
+    con = _connect_history(_load_history(pairs))
+    cap = max(1, min(max_rows, 2000))
+    timer = threading.Timer(QUERY_TIMEOUT_S, con.interrupt)
+    timer.start()
+    try:
+        rows = _rows(con, f"SELECT * FROM ({text}) AS q LIMIT {cap + 1}")
+    except duckdb.Error as exc:
+        raise ToolError(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        timer.cancel()
+    return {"start_date": pairs[0][0], "end_date": pairs[-1][0], "days_read": len(pairs),
+            "truncated": len(rows) > cap, "rows": rows[:cap]}
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -631,8 +904,10 @@ INSTRUCTIONS = (
     "minutes unless a field says seconds; positive means late. Route can be a short name "
     "like 'NX1' or a full route_id. Operators come from AT's static GTFS (route agency), "
     "falling back to vehicle label fleet codes (RT, NB, GB...). Operator filters accept a "
-    "code or part of a name. Use the named at_ tools for common questions and "
-    "at_query_feed for anything else.\n\n" + FEED_COLUMNS_HELP
+    "code or part of a name. For today and right now use the realtime tools (at_late_trips, "
+    "at_whats_running, at_query_feed...). For yesterday and earlier, and any date range "
+    "(this week, this month), use at_performance and at_query_history: they read one "
+    "combined file per day, so they're fast.\n\n" + FEED_COLUMNS_HELP + "\n\n" + TRIPS_COLUMNS_HELP
 )
 
 TOOLS = {
@@ -644,10 +919,32 @@ TOOLS = {
     "at_on_time_summary": on_time_summary,
     "at_alerts": get_alerts,
     "at_query_feed": query_feed,
+    "at_performance": performance,
+    "at_query_history": query_history,
 }
+
+
+def _explained(fn):
+    """Turn unexpected errors into a ToolError with the real message, so the AI
+    (and whoever's debugging) sees what went wrong instead of a generic error."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as exc:
+            logging.exception("%s failed", fn.__name__)
+            text = str(exc)
+            if "AuthorizationPermissionMismatch" in text or "AuthorizationFailure" in text:
+                raise ToolError("rit-mcp can't read the data lake (no Storage Blob Data Reader role).") from exc
+            raise ToolError(f"{type(exc).__name__}: {text[:500]}") from exc
+
+    return wrapper
 
 
 def register(mcp) -> None:
     """Add this source's tools to the shared MCP server."""
     for name, fn in TOOLS.items():
-        mcp.tool(name=name)(fn)
+        mcp.tool(name=name)(_explained(fn))
