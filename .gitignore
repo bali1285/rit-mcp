@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python_packages/
+
+# Functions local settings (holds secrets)
+local.settings.json
+
+# Local test data
+data/
+*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db

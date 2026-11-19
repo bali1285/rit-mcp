@@ -1,0 +1,22 @@
+{
+  "inputs": [
+    {
+      "id": "rit-mcp-token",
+      "type": "promptString",
+      "description": "rit-mcp APP_API_TOKEN",
+      "password": true
+    }
+  ],
+  "servers": {
+    "rit-mcp": {
+      "type": "http",
+      "url": "https://rit-mcp-d4ffhqcpg3f8hyfy.australiaeast-01.azurewebsites.net/mcp",
+      "headers": { "Authorization": "Bearer ${input:rit-mcp-token}" }
+    },
+    "rit-mcp-local": {
+      "type": "http",
+      "url": "http://localhost:7071/mcp",
+      "headers": { "Authorization": "Bearer local-dev-token-change-me-32-characters-plus" }
+    }
+  }
+}

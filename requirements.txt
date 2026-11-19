@@ -1,0 +1,7 @@
+mcp>=2.3,<3
+uvicorn>=0.30
+duckdb>=1.1
+pyarrow>=17
+azure-identity>=1.17
+azure-storage-blob>=12.20
+tzdata
