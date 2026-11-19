@@ -33,10 +33,10 @@ That hosting option is in public preview.
 | `at_vehicle_positions` | Where vehicles are, by route and/or operator |
 | `at_alerts` | Service alerts active now: headline, routes, stops affected, active times |
 | `at_cancellations` | Cancelled trips today (or a day), split by operator |
-| `at_on_time_summary` | Punctuality today (or a day) from the minute snapshots |
+| `at_on_time_summary` | On time, delayed and major delay today (or a day), plus early and late starts. Group by operator, route or Ritchies depot |
 | `at_query_feed` | Anything else about today: read-only SQL over the `feed` view |
-| `at_performance` | Any date range (yesterday and earlier): late %, cancelled %, vehicles used, by operator, area, route, day or mode |
-| `at_query_history` | Anything else over a date range: read-only SQL over the `trips` view |
+| `at_performance` | Any date range (yesterday and earlier): missed, cancelled, delayed, major delay, punctuality, reliability, vehicles used. By operator, area, route, day, mode or Ritchies depot |
+| `at_query_history` | Anything else over a date range: read-only SQL over the `trips`, `scheduled` and `missed` views |
 | `at_alerts_history` | Alerts over a date range: counts by effect and cause, most affected routes, the alerts themselves |
 | `at_describe_feed` | Latest snapshot, operators, and the `feed` columns |
 
@@ -47,7 +47,9 @@ Data:
 - Operators: AT static GTFS in `aucklandtransport/GTFS/`. The server uses the newest `at_gtfs_routes_YYYYMMDD.parquet`, the `at_gtfs_agency_` file of the same date and the newest `at_gtfs_stops_` file, reloaded every 6 hours. Routes it can't match fall back to vehicle label letters (RT, NB, GB).
 - Area (Central, North Shore, West, East, South, Far South, Far North, Islands) is approximate, from stop or vehicle positions.
 - Vehicle positions outside the Auckland region are treated as junk GPS and blanked (`position_valid = false`). About a quarter of reporting vehicles do this, mostly parked ones.
-- "Late" is more than 5 minutes behind at the trip's last reported stop. Arriving early at the end of a route is normal and isn't counted as a failure.
+- Definitions match the Command Centre (all env-overridable): delayed is more than 2 min late, major delay more than 5. Punctual is no more than 5 min late at the final stop, reliable no more than 15. Early start is leaving the first stop more than 1 min early, late start more than 5 min late. Arriving early at the end of a route is normal and counts as on time.
+- Missed trips: scheduled in the GTFS timetable (trips, stop_times, calendar, calendar_dates) but never in the feed, not even as cancelled. A trip counts as seen if its trip_id turned up, or another variant of the same slot (route, start time, direction) did. Trips after midnight are only judged once the next day's file exists. Days outside the timetable on file get no missed figure, and the tool says so.
+- Depots: Ritchies trips get a depot and division from `assets/route-depot-unit.csv` (same file as the Command Centre), matched on the middle part of the trip_id. Other operators have no depot. Update the CSV when the route allocation changes.
 - Alert text arrives as Python-style text; the server parses it into plain headlines, route lists and times.
 - `at_query_feed` and `at_query_history` run in an in-memory DuckDB with file and network access switched off and settings locked.
 

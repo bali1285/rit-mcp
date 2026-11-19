@@ -13,6 +13,7 @@ All tools are registered with an `at_` prefix by `register()`.
 from __future__ import annotations
 
 import ast
+import csv
 import functools
 import json
 import logging
@@ -49,9 +50,15 @@ MAX_FILES_PER_CALL = int(os.getenv("MAX_FILES_PER_CALL", "200"))
 CACHE_FILES = int(os.getenv("CACHE_FILES", "256"))
 QUERY_TIMEOUT_S = float(os.getenv("QUERY_TIMEOUT_S", "30"))
 
-# Punctuality window, in minutes. Defaults: up to 1 min early, up to 5 min late.
-EARLY_LIMIT_MIN = float(os.getenv("ON_TIME_EARLY_MIN", "1"))
-LATE_LIMIT_MIN = float(os.getenv("ON_TIME_LATE_MIN", "5"))
+# Definitions, in minutes, from the Command Centre's OpsCentre (LOGIC.md):
+DELAYED_MIN = float(os.getenv("DELAYED_MIN", "2"))            # delayed: more than 2 min late
+MAJOR_DELAY_MIN = float(os.getenv("MAJOR_DELAY_MIN", "5"))    # major delay: more than 5 min late
+PUNCTUALITY_MIN = float(os.getenv("PUNCTUALITY_MIN", "5"))    # punctual: at the last stop within 5 min
+RELIABILITY_MIN = float(os.getenv("RELIABILITY_MIN", "15"))   # reliable: at the last stop within 15 min
+EARLY_START_MIN = float(os.getenv("EARLY_START_MIN", "1"))    # early start: left the first stop over 1 min early
+LATE_START_MIN = float(os.getenv("LATE_START_MIN", "5"))      # late start: left the first stop over 5 min late
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 # ---------------------------------------------------------------------------
 # Storage: list and read snapshot files (lake, or a local copy for testing)
@@ -340,8 +347,11 @@ SELECT b.*,
             WHEN r.fleet_code IS NOT NULL THEN 'inferred from route' END AS operator_source,
        CASE CAST(TRY_CAST(coalesce(g.route_type, gs.route_type) AS DOUBLE) AS INTEGER)
             WHEN 0 THEN 'tram' WHEN 1 THEN 'metro' WHEN 2 THEN 'rail' WHEN 3 THEN 'bus'
-            WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode
+            WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.depot END AS depot,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.division END AS division
 FROM base b
+LEFT JOIN depots d ON d.route_uid = ltrim(split_part(b.trip_id, '-', 2), '0')
 LEFT JOIN gtfs_routes g ON g.route_id = b.route_id
 LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = regexp_replace(b.route_id, '-[^-]*$', '')
 LEFT JOIN route_operator r ON r.route_id = b.route_id
@@ -360,6 +370,7 @@ feed: one row per feed entity per snapshot.
   operator_code, operator   agency from static GTFS routes; falls back to vehicle fleet code
   operator_source  'gtfs route' | 'gtfs short name' | 'vehicle label' | 'inferred from route'
   mode            bus | rail | ferry | school bus ... (from static GTFS route_type)
+  depot, division Ritchies trips only: depot and division from the Command Centre route list
   lat, lon, bearing, speed_kmh, occupancy   (vehicle rows; lat/lon NULL when the GPS is junk)
   position_valid  false when a vehicle reports a position outside the Auckland region
   event_epoch     feed timestamp, unix seconds
@@ -384,6 +395,7 @@ def _connect(table: pa.Table) -> duckdb.DuckDBPyConnection:
     con.register("raw", _conform(table))
     con.register("operators", pa.table({"code": list(FLEET_OPERATORS), "name": list(FLEET_OPERATORS.values())}))
     con.register("gtfs_routes", _gtfs_routes())
+    con.register("depots", _depots())
     con.execute(FEED_SQL)
     # From here the connection can only read what's registered: no files,
     # no network, no extensions, and the settings can't be changed back.
@@ -551,46 +563,67 @@ def get_cancellations(date: str | None = None, route: str | None = None,
 
 
 def on_time_summary(route: str | None = None, operator: str | None = None, date: str | None = None,
-                    every_minutes: int = 15, group_by_operator: bool = False) -> dict:
-    """Punctuality for a day (Auckland time, YYYY-MM-DD, default today),
-    optionally for one route or operator, or split by operator. Uses each
-    trip's last observed delay. On time = no more than ON_TIME_EARLY_MIN early
-    and ON_TIME_LATE_MIN late (defaults 1 and 5 minutes). An estimate from
-    sampled snapshots, not an official AT figure."""
+                    every_minutes: int = 10, group_by: str = "none", depot: str | None = None) -> dict:
+    """Punctuality for a day from the minute snapshots (Auckland time,
+    YYYY-MM-DD, default today), using the Command Centre definitions:
+    delayed = more than 2 min late, major delay = more than 5 min (each trip's
+    latest delay), early start = left the first stop more than 1 min early
+    (a compliance issue), late start = more than 5 min late leaving it.
+    group_by: none, operator, depot or route. Filters: route, operator, depot
+    (Ritchies). Reads one snapshot every N minutes, so starts are only caught
+    when a snapshot lands while the bus is at its first stop (starts_seen says
+    how many). An estimate, not an official AT figure."""
+    groups = {"none": "NULL", "operator": "operator", "depot": "depot", "route": "route_short_name"}
+    if group_by not in groups:
+        raise ToolError(f"group_by must be one of: {', '.join(groups)}")
     names = _day_names(date, every_minutes)
     day = date or datetime.now(TZ).date().isoformat()
     if not names:
         return {"date": day, "snapshots_read": 0, "trips": 0}
     con = _connect(_load(names))
-    group = "operator" if group_by_operator else "NULL"
+    g = groups[group_by]
     rows = _rows(
         con,
         f"""
-        WITH last_delay AS (
-            SELECT trip_id, any_value(operator) AS operator, arg_max(delay_s, snapshot_time) AS delay_s
-            FROM feed
-            WHERE entity_type = 'trip_update' AND delay_s IS NOT NULL
-              AND coalesce(trip_status, '') <> 'CANCELLED'
+        WITH f AS (
+            SELECT *, regexp_replace(route_id, '-[^-]*$', '') AS route_short_name FROM feed
+            WHERE entity_type = 'trip_update' AND coalesce(trip_status, '') <> 'CANCELLED'
               AND {ROUTE_FILTER} AND (? IS NULL OR operator_code ILIKE ? OR operator ILIKE '%' || ? || '%')
-            GROUP BY trip_id
+              AND (? IS NULL OR depot ILIKE ? OR division ILIKE ?)
+              AND ({str(group_by == "depot").lower()} = false OR operator_code = 'RTH')
+        ),
+        last_delay AS (
+            SELECT trip_id, any_value(operator) AS operator,
+                   coalesce(any_value(depot), 'Unknown depot') AS depot,
+                   any_value(route_short_name) AS route_short_name,
+                   arg_max(delay_s, snapshot_time) AS delay_s
+            FROM f WHERE delay_s IS NOT NULL GROUP BY trip_id
+        ),
+        first_stop AS (
+            SELECT trip_id, arg_max(delay_s, snapshot_time) AS start_delay_s
+            FROM f WHERE stop_sequence = 1 AND delay_s IS NOT NULL GROUP BY trip_id
         )
-        SELECT {group} AS operator, count(*) AS trips,
-               count(*) FILTER (WHERE delay_s BETWEEN -? * 60 AND ? * 60) AS on_time,
-               count(*) FILTER (WHERE delay_s > ? * 60) AS late,
-               count(*) FILTER (WHERE delay_s < -? * 60) AS early,
-               round(100.0 * count(*) FILTER (WHERE delay_s BETWEEN -? * 60 AND ? * 60) / nullif(count(*), 0), 1) AS on_time_pct,
+        SELECT {g} AS {group_by if group_by != "none" else "all_trips"},
+               count(*) AS trips,
+               count(*) FILTER (WHERE delay_s > {DELAYED_MIN} * 60) AS delayed,
+               count(*) FILTER (WHERE delay_s > {MAJOR_DELAY_MIN} * 60) AS major_delay,
+               round(100.0 * count(*) FILTER (WHERE delay_s <= {DELAYED_MIN} * 60) / count(*), 1) AS on_time_pct,
+               round(100.0 * count(*) FILTER (WHERE delay_s > {MAJOR_DELAY_MIN} * 60) / count(*), 1) AS major_delay_pct,
+               count(s.trip_id) AS starts_seen,
+               count(*) FILTER (WHERE s.start_delay_s < -{EARLY_START_MIN} * 60) AS early_starts,
+               count(*) FILTER (WHERE s.start_delay_s > {LATE_START_MIN} * 60) AS late_starts,
                round(median(delay_s) / 60.0, 1) AS median_delay_minutes
-        FROM last_delay
+        FROM last_delay l LEFT JOIN first_stop s USING (trip_id)
         GROUP BY 1 ORDER BY trips DESC
         """,
-        _route_params(route) + [operator, operator, operator,
-                                EARLY_LIMIT_MIN, LATE_LIMIT_MIN, LATE_LIMIT_MIN,
-                                EARLY_LIMIT_MIN, EARLY_LIMIT_MIN, LATE_LIMIT_MIN],
+        _route_params(route) + [operator, operator, operator, depot, depot, depot],
     )
-    head = {"date": day, "route": route, "operator": operator, "snapshots_read": len(names),
-            "on_time_window_minutes": {"early": EARLY_LIMIT_MIN, "late": LATE_LIMIT_MIN}}
-    if group_by_operator:
-        return {**head, "by_operator": rows}
+    head = {"date": day, "route": route, "operator": operator, "depot": depot,
+            "snapshots_read": len(names),
+            "definitions_minutes": {"delayed_over": DELAYED_MIN, "major_delay_over": MAJOR_DELAY_MIN,
+                                    "early_start_over": EARLY_START_MIN, "late_start_over": LATE_START_MIN}}
+    if group_by != "none":
+        return {**head, "group_by": group_by, "rows": rows}
     return {**head, **(rows[0] if rows else {"trips": 0})}
 
 
@@ -805,9 +838,116 @@ def _load_history(pairs: list[tuple[str, str]]) -> pa.Table:
     return pa.concat_tables(parts)
 
 
+def _depots() -> pa.Table:
+    """Ritchies route_uid -> depot, division, unit (from the Command Centre's
+    route-depot-unit.csv). route_uid is the middle part of a trip_id, e.g.
+    "14703" in "1001-14703-55500-2-49e674df", without leading zeros."""
+    global _DEPOTS
+    if _DEPOTS is None:
+        rows = {"route_uid": [], "depot": [], "division": [], "unit_number": []}
+        path = ASSETS / "route-depot-unit.csv"
+        if path.is_file():
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    uid = (r.get("route_uid") or "").strip().lstrip("0")
+                    if uid:
+                        rows["route_uid"].append(uid)
+                        rows["depot"].append((r.get("depot") or "").strip() or None)
+                        rows["division"].append((r.get("division") or "").strip() or None)
+                        rows["unit_number"].append((r.get("unit_number") or "").strip() or None)
+        _DEPOTS = pa.table({k: pa.array(v, pa.string()) for k, v in rows.items()})
+    return _DEPOTS
+
+
+_DEPOTS = None
+
+
+def _gtfs_latest(names: list[str], kind: str) -> str | None:
+    # Exact table name then a date, so 'calendar' doesn't pick up 'calendar_dates'.
+    pat = re.compile(rf"at_gtfs_{re.escape(kind)}_\d{{8}}\.parquet")
+    dated = sorted(n for n in names if pat.fullmatch(Path(n).name))
+    if dated:
+        return dated[-1]
+    return next((n for n in names if Path(n).name == f"{kind}.parquet"), None)
+
+
+def _read_cols(name: str, columns: list[str]) -> pa.Table:
+    """Read only some columns of a GTFS file, as text."""
+    if LOCAL_DATA_DIR:
+        t = pq.read_table(Path(LOCAL_DATA_DIR) / name)
+    else:
+        t = pq.read_table(pa.BufferReader(_container().download_blob(name).readall()))
+    return pa.table({c: _str_col(t, c) for c in columns})
+
+
+_sched_cache: dict = {"loaded": 0.0, "data": None}
+
+
+def _gtfs_schedule() -> dict:
+    """The static timetable, boiled down to one row per scheduled trip:
+    service_id, first departure, first and last stop, and the dates the feed
+    covers. Built from the newest GTFS trips, stop_times, calendar and
+    calendar_dates files, cached for GTFS_REFRESH_S."""
+    if _sched_cache["data"] is not None and time.time() - _sched_cache["loaded"] < GTFS_REFRESH_S:
+        return _sched_cache["data"]
+    empty = {
+        "trips": pa.table({c: pa.array([], pa.string()) for c in
+                           ["trip_id", "route_id", "service_id", "direction_id", "start_time",
+                            "first_stop_id", "final_stop_sequence", "final_stop_id", "end_time"]}),
+        "calendar": pa.table({c: pa.array([], pa.string()) for c in
+                              ["service_id", "monday", "tuesday", "wednesday", "thursday", "friday",
+                               "saturday", "sunday", "start_date", "end_date"]}),
+        "calendar_dates": pa.table({c: pa.array([], pa.string()) for c in ["service_id", "date", "exception_type"]}),
+        "feed_start": None, "feed_end": None, "source": None,
+    }
+    data = empty
+    try:
+        names = _list(GTFS_PREFIX)
+        trips_name = _gtfs_latest(names, "trips")
+        st_name = _gtfs_latest(names, "stop_times")
+        cal_name = _gtfs_latest(names, "calendar")
+        cd_name = _gtfs_latest(names, "calendar_dates")
+        if trips_name and st_name and cal_name:
+            trips = _read_cols(trips_name, ["trip_id", "route_id", "service_id", "direction_id"])
+            st = _read_cols(st_name, ["trip_id", "stop_sequence", "stop_id", "arrival_time", "departure_time"])
+            cal = _read_cols(cal_name, empty["calendar"].column_names)
+            cd = _read_cols(cd_name, ["service_id", "date", "exception_type"]) if cd_name else empty["calendar_dates"]
+            con = duckdb.connect()
+            con.register("trips", trips)
+            con.register("st", st)
+            sched = con.sql("""
+                WITH s AS (SELECT trip_id, CAST(stop_sequence AS INTEGER) AS seq, stop_id,
+                                  arrival_time, departure_time FROM st)
+                SELECT t.trip_id, t.route_id, t.service_id, t.direction_id,
+                       min_by(coalesce(s.departure_time, s.arrival_time), s.seq) AS start_time,
+                       min_by(s.stop_id, s.seq) AS first_stop_id,
+                       CAST(max(s.seq) AS VARCHAR) AS final_stop_sequence,
+                       max_by(s.stop_id, s.seq) AS final_stop_id,
+                       max_by(coalesce(s.arrival_time, s.departure_time), s.seq) AS end_time
+                FROM trips t JOIN s USING (trip_id)
+                GROUP BY ALL
+            """).fetch_arrow_table()
+            starts = [d for d in cal["start_date"].to_pylist() if d]
+            ends = [d for d in cal["end_date"].to_pylist() if d]
+            info_name = _gtfs_latest(names, "feed_info")
+            feed_start, feed_end = (min(starts) if starts else None), (max(ends) if ends else None)
+            if info_name:
+                info = _read_cols(info_name, ["feed_start_date", "feed_end_date"]).to_pylist()
+                if info and info[0]["feed_start_date"]:
+                    feed_start, feed_end = info[0]["feed_start_date"], info[0]["feed_end_date"] or feed_end
+            data = {"trips": sched, "calendar": cal, "calendar_dates": cd,
+                    "feed_start": feed_start, "feed_end": feed_end, "source": trips_name}
+    except Exception:
+        logging.exception("Could not build the GTFS schedule from %s", GTFS_PREFIX)
+    _sched_cache.update(loaded=time.time(), data=data)
+    return data
+
+
 TRIPS_SQL = r"""
 CREATE MACRO nz(x) AS nullif(nullif(trim(CAST(x AS VARCHAR)), 'nan'), '');
 CREATE MACRO num(x) AS TRY_CAST(nz(x) AS DOUBLE);
+CREATE MACRO short_name(r) AS regexp_replace(r, '-[^-]*$', '');
+CREATE MACRO uid_of(trip_id) AS ltrim(split_part(trip_id, '-', 2), '0');
 
 -- Approximate area from a stop's position. Rough boxes, good enough to
 -- compare parts of Auckland, not to draw boundaries.
@@ -824,11 +964,11 @@ CREATE MACRO area_of(lat, lon) AS CASE
 
 CREATE VIEW trips_raw AS
 SELECT
-    CAST(service_date AS DATE) AS service_date,
+    CAST(service_date AS DATE) AS file_date,
     nz(trip_update_trip_trip_id) AS trip_id,
     nz(trip_update_trip_route_id) AS route_id,
     CAST(num(trip_update_trip_direction_id) AS INTEGER) AS direction_id,
-    nz(trip_update_trip_start_date) AS start_date,
+    TRY_CAST(strptime(nz(trip_update_trip_start_date), '%Y%m%d') AS DATE) AS start_date,
     nz(trip_update_trip_start_time) AS start_time,
     CAST(num(trip_update_trip_schedule_relationship) AS INTEGER) = 3 AS cancelled,
     coalesce(num(trip_update_delay), num(trip_update_stop_time_update_departure_delay),
@@ -842,10 +982,13 @@ SELECT
 FROM raw_trips
 WHERE nz(trip_update_trip_trip_id) IS NOT NULL;
 
--- The daily file can hold a trip twice: keep its latest update.
+-- A trip belongs to its start_date (its service day), whichever daily file it
+-- turned up in. Keep its latest update.
 CREATE VIEW trips_dedup AS
-SELECT * FROM trips_raw
-QUALIFY row_number() OVER (PARTITION BY service_date, trip_id ORDER BY event_epoch DESC NULLS LAST) = 1;
+SELECT * EXCLUDE (file_date), coalesce(start_date, file_date) AS service_date
+FROM trips_raw
+QUALIFY row_number() OVER (PARTITION BY coalesce(start_date, file_date), trip_id
+                           ORDER BY event_epoch DESC NULLS LAST) = 1;
 
 CREATE VIEW gtfs_by_short AS
 SELECT route_short_name, any_value(agency_id) AS agency_id, any_value(agency_name) AS agency_name,
@@ -853,46 +996,120 @@ SELECT route_short_name, any_value(agency_id) AS agency_id, any_value(agency_nam
 FROM gtfs_routes WHERE route_short_name IS NOT NULL
 GROUP BY route_short_name HAVING count(DISTINCT agency_id) = 1;
 
-CREATE VIEW trips AS
+CREATE VIEW trips_all AS
 SELECT t.*,
-       regexp_replace(t.route_id, '-[^-]*$', '') AS route_short_name,
+       short_name(t.route_id) AS route_short_name,
        coalesce(g.agency_name, gs.agency_name, o.name, t.fleet_code) AS operator,
        coalesce(g.agency_id, gs.agency_id, t.fleet_code) AS operator_code,
        CASE CAST(TRY_CAST(coalesce(g.route_type, gs.route_type) AS DOUBLE) AS INTEGER)
             WHEN 0 THEN 'tram' WHEN 1 THEN 'metro' WHEN 2 THEN 'rail' WHEN 3 THEN 'bus'
             WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.depot END AS depot,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.division END AS division,
        s.stop_name AS last_stop_name,
        area_of(TRY_CAST(s.stop_lat AS DOUBLE), TRY_CAST(s.stop_lon AS DOUBLE)) AS area,
-       CASE WHEN t.cancelled THEN 'cancelled'
-            WHEN t.delay_s IS NULL THEN 'unknown'
-            WHEN t.delay_s > ? * 60 THEN 'late'
-            WHEN t.delay_s < -? * 60 THEN 'early'
-            ELSE 'on time' END AS outcome
+       TRY_CAST(st.final_stop_sequence AS INTEGER) AS final_stop_sequence,
+       -- Reached the end: last reported stop is the final scheduled stop.
+       t.last_stop_sequence >= TRY_CAST(st.final_stop_sequence AS INTEGER)
+           OR (t.last_stop_id IS NOT NULL AND t.last_stop_id = st.final_stop_id) AS reached_end
 FROM trips_dedup t
 LEFT JOIN gtfs_routes g ON g.route_id = t.route_id
-LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = regexp_replace(t.route_id, '-[^-]*$', '')
+LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = short_name(t.route_id)
 LEFT JOIN operators o ON o.code = t.fleet_code
-LEFT JOIN gtfs_stops s ON s.stop_id = t.last_stop_id;
+LEFT JOIN depots d ON d.route_uid = uid_of(t.trip_id)
+LEFT JOIN gtfs_stops s ON s.stop_id = t.last_stop_id
+LEFT JOIN sched_trips st ON st.trip_id = t.trip_id;
+
+CREATE VIEW trips_base AS
+SELECT * FROM trips_all WHERE service_date BETWEEN range_start() AND range_end();
+
+-- Scheduled trips for each day in range, from calendar + calendar_dates.
+CREATE VIEW active_services AS
+WITH days AS (SELECT CAST(d AS DATE) AS service_date FROM service_days),
+weekly AS (
+    SELECT d.service_date, c.service_id
+    FROM days d JOIN calendar c
+      ON d.service_date BETWEEN strptime(c.start_date, '%Y%m%d') AND strptime(c.end_date, '%Y%m%d')
+     AND CASE dayofweek(d.service_date)
+            WHEN 0 THEN c.sunday WHEN 1 THEN c.monday WHEN 2 THEN c.tuesday WHEN 3 THEN c.wednesday
+            WHEN 4 THEN c.thursday WHEN 5 THEN c.friday WHEN 6 THEN c.saturday END = '1'
+),
+added AS (
+    SELECT CAST(strptime(cd.date, '%Y%m%d') AS DATE) AS service_date, cd.service_id
+    FROM calendar_dates cd JOIN days d ON CAST(strptime(cd.date, '%Y%m%d') AS DATE) = d.service_date
+    WHERE cd.exception_type = '1'
+),
+removed AS (
+    SELECT CAST(strptime(cd.date, '%Y%m%d') AS DATE) AS service_date, cd.service_id
+    FROM calendar_dates cd WHERE cd.exception_type = '2'
+)
+SELECT * FROM (SELECT * FROM weekly UNION SELECT * FROM added)
+EXCEPT SELECT * FROM removed;
+
+CREATE VIEW scheduled AS
+SELECT a.service_date, st.trip_id, st.route_id, short_name(st.route_id) AS route_short_name,
+       TRY_CAST(st.direction_id AS INTEGER) AS direction_id, st.start_time,
+       coalesce(g.agency_name, gs.agency_name) AS operator,
+       coalesce(g.agency_id, gs.agency_id) AS operator_code,
+       CASE CAST(TRY_CAST(coalesce(g.route_type, gs.route_type) AS DOUBLE) AS INTEGER)
+            WHEN 0 THEN 'tram' WHEN 1 THEN 'metro' WHEN 2 THEN 'rail' WHEN 3 THEN 'bus'
+            WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.depot END AS depot,
+       CASE WHEN coalesce(g.agency_id, gs.agency_id) = 'RTH' THEN d.division END AS division,
+       CAST(NULL AS VARCHAR) AS area
+FROM active_services a
+JOIN sched_trips st USING (service_id)
+LEFT JOIN gtfs_routes g ON g.route_id = st.route_id
+LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = short_name(st.route_id)
+LEFT JOIN depots d ON d.route_uid = uid_of(st.trip_id);
+
+-- Missed: scheduled but never in the feed, not even cancelled. A trip counts
+-- as seen if its trip_id turned up that day, or another calendar variant of
+-- the same slot (route, start time, direction) did (Command Centre slot-key
+-- rule). Trips starting after midnight are only judged when the next day's
+-- file has been read.
+CREATE VIEW missed AS
+SELECT s.*
+FROM scheduled s
+WHERE NOT EXISTS (SELECT 1 FROM trips_all t WHERE t.service_date = s.service_date AND t.trip_id = s.trip_id)
+  AND NOT EXISTS (SELECT 1 FROM trips_all t
+                  WHERE t.service_date = s.service_date AND t.route_short_name = s.route_short_name
+                    AND t.start_time = s.start_time
+                    AND coalesce(t.direction_id, -1) = coalesce(s.direction_id, -1))
+  AND (s.start_time < '24:00:00' OR next_day_read(s.service_date));
 """
 
 TRIPS_COLUMNS_HELP = """\
 trips: one row per trip per service day, from the daily files (yesterday and earlier).
-  service_date    DATE         the day the file covers
-  trip_id, route_id, route_short_name, direction_id, start_date, start_time
+  service_date    DATE         the trip's service day (its start_date)
+  trip_id, route_id, route_short_name, direction_id, start_time
   cancelled       BOOLEAN
   delay_s         final known delay in seconds, positive = late
-  outcome         'on time' | 'late' | 'early' | 'cancelled' | 'unknown'
-                  (late = more than ON_TIME_LATE_MIN late, early = more than ON_TIME_EARLY_MIN early)
-                  Delay is at the trip's last reported stop, usually near the end of the route,
-                  where arriving early is normal. Treat 'early' as not late, not as a failure.
+  outcome         'on time' (no more than 2 min late) | 'minor delay' (2-5 min) |
+                  'major delay' (more than 5 min) | 'cancelled' | 'unknown'
+  reached_end     the last reported stop is the trip's final stop (from the GTFS timetable)
+  punctual        reached_end and no more than 5 min late at the last stop
+  reliable        reached_end and no more than 15 min late at the last stop
   operator, operator_code, mode (bus | rail | ferry ...)
+  depot, division Ritchies trips only: depot (Albany, Ascot, Birkenhead, Oruarangi, Swanson,
+                  Takanini, Westgate) and division code, from the Command Centre route list
   area            approximate, from the last stop's position: Central, North Shore, West,
                   East, South, Far South, Far North, Islands (NULL for cancelled trips)
-  last_stop_id, last_stop_name, last_stop_sequence, vehicle_id, vehicle_label, fleet_code
-Notes: percentages should use trips with a known outcome; cancelled trips have no area."""
+  last_stop_id, last_stop_name, last_stop_sequence, final_stop_sequence,
+  vehicle_id, vehicle_label, fleet_code
+missed: one row per scheduled trip that never appeared in the feed (same columns as
+  scheduled: service_date, trip_id, route_id, route_short_name, direction_id, start_time,
+  operator, operator_code, mode, depot, division). Only for days the GTFS timetable covers.
+scheduled: every trip the GTFS timetable says should run on each day.
+Definitions follow the Command Centre (OpsCentre): delayed > 2 min, major > 5 min,
+punctuality = arrive at the last stop within 5 min, reliability = within 15 min.
+Delay is at the trip's last reported stop; arriving early at the end is normal and not a failure."""
 
 
-def _connect_history(table: pa.Table) -> duckdb.DuckDBPyConnection:
+def _connect_history(pairs: list[tuple[str, str]], table: pa.Table, next_day_read: set[str],
+                     start: str, end: str):
+    """Returns (connection, days the timetable covers so missed trips can be judged)."""
+    sched = _gtfs_schedule()
     con = duckdb.connect()
     con.execute("SET threads = 4")
     con.execute(f"SET memory_limit = '{os.getenv('DUCKDB_MEMORY_LIMIT', '1GB')}'")
@@ -900,91 +1117,169 @@ def _connect_history(table: pa.Table) -> duckdb.DuckDBPyConnection:
     con.register("operators", pa.table({"code": list(FLEET_OPERATORS), "name": list(FLEET_OPERATORS.values())}))
     con.register("gtfs_routes", _gtfs_routes())
     con.register("gtfs_stops", _gtfs_stops())
-    # The thresholds are baked into the view so every query uses the same definition.
-    sql = TRIPS_SQL.replace("? * 60 THEN 'late'", f"{float(LATE_LIMIT_MIN)} * 60 THEN 'late'")
-    sql = sql.replace("-? * 60 THEN 'early'", f"-{float(EARLY_LIMIT_MIN)} * 60 THEN 'early'")
-    con.execute(sql)
+    con.register("depots", _depots())
+    con.register("sched_trips", sched["trips"])
+    con.register("calendar", sched["calendar"])
+    con.register("calendar_dates", sched["calendar_dates"])
+    # Only judge days the timetable covers.
+    fs, fe = sched["feed_start"], sched["feed_end"]
+    days = [d for d, _ in pairs
+            if fs and fe and fs <= d.replace("-", "") <= fe]
+    con.register("service_days", pa.table({"d": pa.array(days, pa.string())}))
+    con.execute(f"CREATE MACRO range_start() AS DATE '{start}'")
+    con.execute(f"CREATE MACRO range_end() AS DATE '{end}'")
+    nd = ", ".join(f"DATE '{d}'" for d in sorted(next_day_read)) or "NULL"
+    con.execute(f"CREATE MACRO next_day_read(d) AS d IN ({nd})")
+    con.execute(TRIPS_SQL)
+    con.execute(f"""
+        CREATE VIEW trips_scored AS
+        SELECT *,
+               CASE WHEN cancelled THEN 'cancelled'
+                    WHEN delay_s IS NULL THEN 'unknown'
+                    WHEN delay_s > {MAJOR_DELAY_MIN} * 60 THEN 'major delay'
+                    WHEN delay_s > {DELAYED_MIN} * 60 THEN 'minor delay'
+                    ELSE 'on time' END AS outcome,
+               coalesce(reached_end, false) AND NOT cancelled AND delay_s <= {PUNCTUALITY_MIN} * 60 AS punctual,
+               coalesce(reached_end, false) AND NOT cancelled AND delay_s <= {RELIABILITY_MIN} * 60 AS reliable
+        FROM trips_base
+    """)
+    con.execute("CREATE VIEW trips AS SELECT * FROM trips_scored")
     con.execute("SET enable_external_access = false")
     con.execute("SET lock_configuration = true")
-    return con
+    return con, days
+
+
+def _load_range(start_date: str, end_date: str | None):
+    """Daily trip files for the range, plus the day after (late-night trips of
+    the last day land there) when it exists."""
+    pairs = _history_names(start_date, end_date)
+    last = datetime.strptime(end_date or start_date, "%Y-%m-%d").date()
+    extra = _history_names((last + timedelta(days=1)).isoformat(), None)
+    files = pairs + extra
+    have = {d for d, _ in files}
+    next_day_read = {d for d, _ in pairs
+                     if (datetime.strptime(d, "%Y-%m-%d").date() + timedelta(days=1)).isoformat() in have}
+    return pairs, _load_history(files), next_day_read
 
 
 GROUPINGS = {
-    "operator": "operator",
-    "area": "area",
-    "operator_area": "operator, area",
-    "route": "route_short_name, operator",
-    "day": "service_date",
-    "operator_day": "operator, service_date",
-    "mode": "mode",
+    "operator": ["operator"],
+    "depot": ["depot", "division"],
+    "depot_route": ["depot", "route_short_name"],
+    "area": ["area"],
+    "operator_area": ["operator", "area"],
+    "route": ["route_short_name", "operator"],
+    "day": ["service_date"],
+    "operator_day": ["operator", "service_date"],
+    "depot_day": ["depot", "service_date"],
+    "mode": ["mode"],
 }
 
 
 def performance(start_date: str, end_date: str | None = None, group_by: str = "operator",
                 operator: str | None = None, route: str | None = None, area: str | None = None,
-                limit: int = 100) -> dict:
-    """Punctuality and cancellations over a date range from the daily files
-    (YYYY-MM-DD; yesterday and earlier, today isn't combined yet). group_by:
-    operator, area, operator_area, route, day, operator_day or mode. Returns
-    trips, cancelled %, late %, on-time %, early % and median delay for each
-    group, plus vehicles_used (distinct vehicles that ran a trip; for
-    group_by day or operator_day that's buses out per day). Delay is measured at each trip's last reported stop, usually near
-    the end of the route, where arriving early is normal: on_time_pct counts
-    every trip that wasn't late, early_pct is shown for info only. Late,
-    on-time and early % are of trips that ran and reported a delay. Filters:
-    operator (code or part of a name), route ('NX1'), area ('North Shore')."""
+                depot: str | None = None, limit: int = 100) -> dict:
+    """Service delivery and punctuality over a date range from the daily files
+    (YYYY-MM-DD; yesterday and earlier, today isn't combined yet), using the
+    Command Centre definitions. group_by: operator, depot, depot_route, area,
+    operator_area, route, day, operator_day, depot_day or mode. For each group:
+    scheduled trips (GTFS), trips run, missed (scheduled but never in the
+    feed), cancelled, delayed % (> 2 min late), major delay % (> 5 min),
+    punctuality % (arrived at the last stop within 5 min) and reliability %
+    (within 15 min), median delay and vehicles used. Depot is Ritchies only.
+    Filters: operator (code or part of a name), route ('NX1'), area
+    ('North Shore'), depot ('Takanini')."""
     if group_by not in GROUPINGS:
         raise ToolError(f"group_by must be one of: {', '.join(GROUPINGS)}")
-    pairs = _history_names(start_date, end_date)
+    pairs, table, next_day_read = _load_range(start_date, end_date)
     if not pairs:
         return {"start_date": start_date, "end_date": end_date or start_date, "days_read": 0, "rows": []}
-    con = _connect_history(_load_history(pairs))
+    start, end = pairs[0][0], pairs[-1][0]
+    con, judged = _connect_history(pairs, table, next_day_read, start, end)
     keys = GROUPINGS[group_by]
-    rows = _rows(
-        con,
-        f"""
-        SELECT {keys},
-               count(*) AS trips,
-               count(DISTINCT vehicle_id) FILTER (WHERE NOT cancelled) AS vehicles_used,
-               count(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
-               round(100.0 * count(*) FILTER (WHERE outcome = 'cancelled') / count(*), 1) AS cancelled_pct,
-               count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')) AS measured,
-               round(100.0 * count(*) FILTER (WHERE outcome = 'late')
-                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS late_pct,
-               round(100.0 * count(*) FILTER (WHERE outcome IN ('on time', 'early'))
-                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS on_time_pct,
-               round(100.0 * count(*) FILTER (WHERE outcome = 'early')
-                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')), 0), 1) AS early_pct,
-               round(median(delay_s) FILTER (WHERE NOT cancelled) / 60.0, 1) AS median_delay_minutes
-        FROM trips
-        WHERE {ROUTE_FILTER}
+    key_sql = ", ".join(keys)
+    depot_only = "depot" in keys
+    where = f"""{ROUTE_FILTER}
+          AND (NOT {str(depot_only).lower()} OR operator_code = 'RTH')
           AND (? IS NULL OR operator_code ILIKE ? OR operator ILIKE '%' || ? || '%')
           AND (? IS NULL OR area ILIKE ?)
-        GROUP BY {keys}
-        ORDER BY {'service_date' if group_by == 'day' else 'trips DESC'}
-        LIMIT ?
-        """,
-        _route_params(route) + [operator, operator, operator, area, area, max(1, min(limit, 1000))],
-    )
-    return {"start_date": pairs[0][0], "end_date": pairs[-1][0], "days_read": len(pairs),
-            "days_missing": ((datetime.strptime(end_date or start_date, "%Y-%m-%d").date()
-                              - datetime.strptime(start_date, "%Y-%m-%d").date()).days + 1 - len(pairs)),
-            "thresholds_minutes": {"late_over": LATE_LIMIT_MIN, "early_over": EARLY_LIMIT_MIN},
-            "group_by": group_by, "rows": rows}
+          AND (? IS NULL OR depot ILIKE ? OR division ILIKE ?)"""
+    params = (_route_params(route) + [operator, operator, operator, area, area, depot, depot, depot])
+    run = _rows(con, f"""
+        SELECT {key_sql},
+               count(*) AS trips_in_feed,
+               count(*) FILTER (WHERE cancelled) AS cancelled,
+               count(DISTINCT vehicle_id) FILTER (WHERE NOT cancelled) AS vehicles_used,
+               count(*) FILTER (WHERE outcome IN ('on time', 'minor delay', 'major delay')) AS measured,
+               round(100.0 * count(*) FILTER (WHERE outcome IN ('minor delay', 'major delay'))
+                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'minor delay', 'major delay')), 0), 1) AS delayed_pct,
+               round(100.0 * count(*) FILTER (WHERE outcome = 'major delay')
+                     / nullif(count(*) FILTER (WHERE outcome IN ('on time', 'minor delay', 'major delay')), 0), 1) AS major_delay_pct,
+               count(*) FILTER (WHERE reached_end AND NOT cancelled AND delay_s IS NOT NULL) AS reached_end,
+               round(100.0 * count(*) FILTER (WHERE punctual)
+                     / nullif(count(*) FILTER (WHERE reached_end AND NOT cancelled AND delay_s IS NOT NULL), 0), 1) AS punctuality_pct,
+               round(100.0 * count(*) FILTER (WHERE reliable)
+                     / nullif(count(*) FILTER (WHERE reached_end AND NOT cancelled AND delay_s IS NOT NULL), 0), 1) AS reliability_pct,
+               round(median(delay_s) FILTER (WHERE NOT cancelled) / 60.0, 1) AS median_delay_minutes
+        FROM (SELECT * REPLACE (coalesce(depot, CASE WHEN operator_code = 'RTH' THEN 'Unknown depot' END) AS depot)
+              FROM trips) WHERE {where}
+        GROUP BY ALL""", params)
+    sched = _rows(con, f"""
+        SELECT {key_sql}, count(*) AS scheduled
+        FROM (SELECT * REPLACE (coalesce(depot, CASE WHEN operator_code = 'RTH' THEN 'Unknown depot' END) AS depot)
+              FROM scheduled) WHERE {where} GROUP BY ALL""", params)
+    miss = _rows(con, f"""
+        SELECT {key_sql}, count(*) AS missed
+        FROM (SELECT * REPLACE (coalesce(depot, CASE WHEN operator_code = 'RTH' THEN 'Unknown depot' END) AS depot)
+              FROM missed) WHERE {where} GROUP BY ALL""", params)
+
+    def k(r):
+        return tuple(r.get(x) for x in keys)
+
+    merged: dict = {}
+    for r in run:
+        merged[k(r)] = r
+    for r in sched:
+        merged.setdefault(k(r), {x: r[x] for x in keys}).update(scheduled=r["scheduled"])
+    for r in miss:
+        merged.setdefault(k(r), {x: r[x] for x in keys}).update(missed=r["missed"])
+    rows = []
+    for r in merged.values():
+        if judged:
+            r.setdefault("scheduled", 0)
+            r.setdefault("missed", 0)
+            r["missed_pct"] = round(100.0 * r["missed"] / r["scheduled"], 2) if r["scheduled"] else None
+        if r.get("trips_in_feed"):
+            r["cancelled_pct"] = round(100.0 * r["cancelled"] / r["trips_in_feed"], 2)
+        rows.append(r)
+    order = "service_date" if keys[-1] == "service_date" else None
+    rows.sort(key=lambda r: (str(r.get(order)) if order else -(r.get("trips_in_feed") or r.get("scheduled") or 0)))
+    return {
+        "start_date": start, "end_date": end, "days_read": len(pairs),
+        "days_missing": ((datetime.strptime(end_date or start_date, "%Y-%m-%d").date()
+                          - datetime.strptime(start_date, "%Y-%m-%d").date()).days + 1 - len(pairs)),
+        "missed_trips_judged_for": f"{len(judged)} of {len(pairs)} days" + (
+            "" if len(judged) == len(pairs) else
+            " (the GTFS timetable on file doesn't cover the rest, so missed and scheduled are left out for them)"),
+        "definitions_minutes": {"delayed_over": DELAYED_MIN, "major_delay_over": MAJOR_DELAY_MIN,
+                                "punctual_within": PUNCTUALITY_MIN, "reliable_within": RELIABILITY_MIN},
+        "group_by": group_by, "rows": rows[: max(1, min(limit, 1000))],
+    }
 
 
 def query_history(sql: str, start_date: str, end_date: str | None = None, max_rows: int = 500) -> dict:
-    """Run your own read-only SQL (DuckDB dialect) against the `trips` view
-    (one row per trip per day, from the daily files) for a date range
-    (YYYY-MM-DD, yesterday and earlier). Only a single SELECT or WITH query.
-    Columns are in the server instructions."""
+    """Run your own read-only SQL (DuckDB dialect) over a date range
+    (YYYY-MM-DD, yesterday and earlier) against the views `trips` (one row per
+    trip per day), `scheduled` (GTFS timetable per day) and `missed`
+    (scheduled trips never seen in the feed). Only a single SELECT or WITH
+    query. Columns are in the server instructions."""
     text = sql.strip().rstrip(";").strip()
     if ";" in text or not text.lower().startswith(("select", "with")):
         raise ToolError("Only one SELECT or WITH query is allowed.")
-    pairs = _history_names(start_date, end_date)
+    pairs, table, next_day_read = _load_range(start_date, end_date)
     if not pairs:
         return {"days_read": 0, "rows": []}
-    con = _connect_history(_load_history(pairs))
+    con, judged = _connect_history(pairs, table, next_day_read, pairs[0][0], pairs[-1][0])
     cap = max(1, min(max_rows, 2000))
     timer = threading.Timer(QUERY_TIMEOUT_S, con.interrupt)
     timer.start()
@@ -995,8 +1290,8 @@ def query_history(sql: str, start_date: str, end_date: str | None = None, max_ro
     finally:
         timer.cancel()
     return {"start_date": pairs[0][0], "end_date": pairs[-1][0], "days_read": len(pairs),
+            "missed_judged_days": len(judged),
             "truncated": len(rows) > cap, "rows": rows[:cap]}
-
 
 
 ALERT_COLUMNS = ["id", "alert_cause", "alert_effect", "alert_header_text_translation",
@@ -1077,7 +1372,11 @@ INSTRUCTIONS = (
     "alerts), captured about once a minute. Times are Auckland local. Delays are in "
     "minutes unless a field says seconds; positive means late. Route can be a short name "
     "like 'NX1' or a full route_id. Operators come from AT's static GTFS (route agency), "
-    "falling back to vehicle label fleet codes (RT, NB, GB...). Operator filters accept a "
+    "falling back to vehicle label fleet codes (RT, NB, GB...). Ritchies trips also carry "
+    "their depot (Albany, Ascot, Birkenhead, Oruarangi, Swanson, Takanini, Westgate). "
+    "Definitions follow the Ritchies Command Centre: delayed > 2 min, major delay > 5 min, "
+    "punctuality = within 5 min at the last stop, reliability = within 15 min, early start = "
+    "left the first stop > 1 min early, missed = scheduled but never in the feed. Operator filters accept a "
     "code or part of a name. For today and right now use the realtime tools (at_late_trips, "
     "at_whats_running, at_query_feed...). For yesterday and earlier, and any date range "
     "(this week, this month), use at_performance, at_query_history and at_alerts_history: "
