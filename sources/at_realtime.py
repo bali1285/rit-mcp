@@ -12,6 +12,7 @@ All tools are registered with an `at_` prefix by `register()`.
 
 from __future__ import annotations
 
+import ast
 import functools
 import json
 import logging
@@ -262,6 +263,7 @@ if os.getenv("AT_FLEET_OPERATORS"):
 FEED_SQL = r"""
 CREATE MACRO nz(x) AS nullif(nullif(trim(CAST(x AS VARCHAR)), 'nan'), '');
 CREATE MACRO num(x) AS TRY_CAST(nz(x) AS DOUBLE);
+CREATE MACRO in_region(lat, lon) AS coalesce(lat BETWEEN -37.6 AND -35.8 AND lon BETWEEN 174.0 AND 175.6, false);
 CREATE MACRO trip_rel(x) AS CASE CAST(num(x) AS INTEGER)
     WHEN 0 THEN 'SCHEDULED' WHEN 1 THEN 'ADDED' WHEN 2 THEN 'UNSCHEDULED' WHEN 3 THEN 'CANCELLED'
     WHEN 5 THEN 'REPLACEMENT' WHEN 6 THEN 'DUPLICATED' WHEN 7 THEN 'DELETED' END;
@@ -289,8 +291,13 @@ SELECT
     regexp_replace(coalesce(nz(vehicle_vehicle_label), nz(trip_update_vehicle_label)), '\s+', ' ', 'g') AS vehicle_label,
     nullif(regexp_extract(coalesce(nz(vehicle_vehicle_label), nz(trip_update_vehicle_label)),
                           '^([A-Z]{2,4})\s*\d+$', 1), '') AS fleet_code,
-    num(vehicle_position_latitude) AS lat,
-    num(vehicle_position_longitude) AS lon,
+    -- Positions outside the Auckland region are junk (parked or offline units report
+    -- anything down to Antarctica), so they become NULL. position_valid says which.
+    CASE WHEN in_region(num(vehicle_position_latitude), num(vehicle_position_longitude))
+         THEN num(vehicle_position_latitude) END AS lat,
+    CASE WHEN in_region(num(vehicle_position_latitude), num(vehicle_position_longitude))
+         THEN num(vehicle_position_longitude) END AS lon,
+    in_region(num(vehicle_position_latitude), num(vehicle_position_longitude)) AS position_valid,
     num(vehicle_position_bearing) AS bearing,
     num(vehicle_position_speed) AS speed_kmh,  -- AT sends km/h despite the GTFS-RT spec saying m/s
     CASE CAST(num(vehicle_occupancy_status) AS INTEGER)
@@ -336,7 +343,7 @@ SELECT b.*,
             WHEN 4 THEN 'ferry' WHEN 712 THEN 'school bus' END AS mode
 FROM base b
 LEFT JOIN gtfs_routes g ON g.route_id = b.route_id
-LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = split_part(b.route_id, '-', 1)
+LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = regexp_replace(b.route_id, '-[^-]*$', '')
 LEFT JOIN route_operator r ON r.route_id = b.route_id
 LEFT JOIN operators o ON o.code = coalesce(b.fleet_code, r.fleet_code);
 """
@@ -353,7 +360,8 @@ feed: one row per feed entity per snapshot.
   operator_code, operator   agency from static GTFS routes; falls back to vehicle fleet code
   operator_source  'gtfs route' | 'gtfs short name' | 'vehicle label' | 'inferred from route'
   mode            bus | rail | ferry | school bus ... (from static GTFS route_type)
-  lat, lon, bearing, speed_kmh, occupancy   (vehicle rows)
+  lat, lon, bearing, speed_kmh, occupancy   (vehicle rows; lat/lon NULL when the GPS is junk)
+  position_valid  false when a vehicle reports a position outside the Auckland region
   event_epoch     feed timestamp, unix seconds
   alert_cause, alert_effect, alert_severity, alert_header, alert_description,
   alert_active_period, alert_informed_entity   (alert rows; text fields hold the raw JSON-ish value)
@@ -586,21 +594,105 @@ def on_time_summary(route: str | None = None, operator: str | None = None, date:
     return {**head, **(rows[0] if rows else {"trips": 0})}
 
 
+def _pyval(text) -> list:
+    """AT alert fields arrive as Python-style text, e.g. "[{'text': 'Detour', 'language': 'en'}]".
+    Parse that safely (literal values only) into a list."""
+    if text is None:
+        return []
+    s = str(text).strip()
+    if not s or s in ("nan", "None"):
+        return []
+    for parse in (ast.literal_eval, json.loads):
+        try:
+            v = parse(s)
+            return v if isinstance(v, list) else [v]
+        except Exception:
+            continue
+    return [s]
+
+
+def _alert_text(raw) -> str | None:
+    items = _pyval(raw)
+    texts = [i.get("text") for i in items if isinstance(i, dict) and i.get("text")]
+    english = [i.get("text") for i in items if isinstance(i, dict) and i.get("language") in ("en", None) and i.get("text")]
+    if english or texts:
+        return (english or texts)[0]
+    return str(items[0]) if items else None
+
+
+def _alert_entities(raw) -> tuple[list[str], int]:
+    routes, stops = set(), set()
+    for i in _pyval(raw):
+        if not isinstance(i, dict):
+            continue
+        if i.get("route_id"):
+            routes.add(str(i["route_id"]))
+        trip = i.get("trip") if isinstance(i.get("trip"), dict) else {}
+        if trip.get("route_id"):
+            routes.add(str(trip["route_id"]))
+        if i.get("stop_id"):
+            stops.add(str(i["stop_id"]))
+    return sorted(routes), len(stops)
+
+
+def _alert_periods(raw) -> list[dict]:
+    out = []
+    for i in _pyval(raw):
+        if not isinstance(i, dict):
+            continue
+        p = {}
+        for k in ("start", "end"):
+            try:
+                if i.get(k):
+                    p[k] = datetime.fromtimestamp(float(i[k]), TZ).isoformat(timespec="minutes")
+            except (TypeError, ValueError):
+                pass
+        if p:
+            out.append(p)
+    return out
+
+
+def _route_matches(routes: list[str], route: str | None) -> bool:
+    if not route:
+        return True
+    r = route.strip().upper()
+    return any(x.upper() == r or x.upper().rsplit("-", 1)[0] == r for x in routes)
+
+
+def _clean_alert(row: dict, description: bool = True) -> dict:
+    routes, stop_count = _alert_entities(row.get("informed_entity"))
+    out = {
+        "id": row.get("id"),
+        "cause": row.get("cause"),
+        "effect": row.get("effect"),
+        "header": _alert_text(row.get("header")),
+        "routes": [r.rsplit("-", 1)[0] for r in routes],
+        "route_ids": routes,
+        "stops_affected": stop_count,
+        "active": _alert_periods(row.get("active_period")),
+    }
+    if description:
+        text = _alert_text(row.get("description"))
+        out["description"] = text[:400] + ("..." if text and len(text) > 400 else "") if text else None
+    return out
+
+
 def get_alerts(route: str | None = None, effect: str | None = None, limit: int = 50) -> dict:
-    """Service alerts in the latest snapshot (cause, effect, header). Filter by
-    route (matched inside the alert's informed entities) or effect, e.g.
-    'NO_SERVICE', 'DETOUR', 'STOP_MOVED'."""
+    """Service alerts active right now (latest snapshot): cause, effect,
+    headline, description, routes affected, number of stops affected and
+    active times. Filter by route ('70' or '70-205') or effect, e.g.
+    'NO_SERVICE', 'DETOUR', 'STOP_MOVED'. For past days use at_alerts_history."""
     name = _latest_name()
     con = _connect(_load([name]))
-    rows = _rows(con, """
-        SELECT entity_id, alert_cause AS cause, alert_effect AS effect, alert_severity AS severity,
-               alert_header AS header, alert_informed_entity AS informed_entity
+    raw = _rows(con, """
+        SELECT entity_id AS id, alert_cause AS cause, alert_effect AS effect,
+               alert_header AS header, alert_description AS description,
+               alert_active_period AS active_period, alert_informed_entity AS informed_entity
         FROM feed
-        WHERE entity_type = 'alert'
-          AND (? IS NULL OR alert_informed_entity ILIKE '%''' || ? || '%')
-          AND (? IS NULL OR alert_effect = upper(?))
-        ORDER BY effect, cause
-        LIMIT ?""", [route, route, effect, effect, max(1, min(limit, 500))])
+        WHERE entity_type = 'alert' AND (? IS NULL OR alert_effect = upper(?))
+        ORDER BY effect, cause""", [effect, effect])
+    cleaned = [_clean_alert(r) for r in raw]
+    rows = [a for a in cleaned if _route_matches(a["route_ids"], route)][: max(1, min(limit, 500))]
     summary = _rows(con, """
         SELECT alert_effect AS effect, count(*) AS alerts FROM feed
         WHERE entity_type = 'alert' GROUP BY 1 ORDER BY 2 DESC""")
@@ -679,8 +771,8 @@ def _gtfs_stops() -> pa.Table:
     return table
 
 
-def _history_names(start_date: str, end_date: str | None) -> list[tuple[str, str]]:
-    """(service_date, blob name) for each daily trip_updates file in the range."""
+def _history_names(start_date: str, end_date: str | None, kind: str = "trip_updates") -> list[tuple[str, str]]:
+    """(service_date, blob name) for each daily file of a kind (trip_updates, alerts) in the range."""
     start = datetime.strptime(start_date, "%Y-%m-%d").date()
     end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else start
     if end < start:
@@ -693,7 +785,7 @@ def _history_names(start_date: str, end_date: str | None) -> list[tuple[str, str
         prefix = f"{FEED_PREFIX}/{day:%Y/%m}/"
         if prefix not in months:  # one listing per month, not per day
             months[prefix] = set(_list(prefix))
-        name = f"{prefix}trip_updates_{day:%d}.parquet"
+        name = f"{prefix}{kind}_{day:%d}.parquet"
         if name in months[prefix]:
             picked.append((day.isoformat(), name))
         day += timedelta(days=1)
@@ -763,7 +855,7 @@ GROUP BY route_short_name HAVING count(DISTINCT agency_id) = 1;
 
 CREATE VIEW trips AS
 SELECT t.*,
-       split_part(t.route_id, '-', 1) AS route_short_name,
+       regexp_replace(t.route_id, '-[^-]*$', '') AS route_short_name,
        coalesce(g.agency_name, gs.agency_name, o.name, t.fleet_code) AS operator,
        coalesce(g.agency_id, gs.agency_id, t.fleet_code) AS operator_code,
        CASE CAST(TRY_CAST(coalesce(g.route_type, gs.route_type) AS DOUBLE) AS INTEGER)
@@ -778,7 +870,7 @@ SELECT t.*,
             ELSE 'on time' END AS outcome
 FROM trips_dedup t
 LEFT JOIN gtfs_routes g ON g.route_id = t.route_id
-LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = split_part(t.route_id, '-', 1)
+LEFT JOIN gtfs_by_short gs ON g.route_id IS NULL AND gs.route_short_name = regexp_replace(t.route_id, '-[^-]*$', '')
 LEFT JOIN operators o ON o.code = t.fleet_code
 LEFT JOIN gtfs_stops s ON s.stop_id = t.last_stop_id;
 """
@@ -835,7 +927,8 @@ def performance(start_date: str, end_date: str | None = None, group_by: str = "o
     (YYYY-MM-DD; yesterday and earlier, today isn't combined yet). group_by:
     operator, area, operator_area, route, day, operator_day or mode. Returns
     trips, cancelled %, late %, on-time %, early % and median delay for each
-    group. Delay is measured at each trip's last reported stop, usually near
+    group, plus vehicles_used (distinct vehicles that ran a trip; for
+    group_by day or operator_day that's buses out per day). Delay is measured at each trip's last reported stop, usually near
     the end of the route, where arriving early is normal: on_time_pct counts
     every trip that wasn't late, early_pct is shown for info only. Late,
     on-time and early % are of trips that ran and reported a delay. Filters:
@@ -852,6 +945,7 @@ def performance(start_date: str, end_date: str | None = None, group_by: str = "o
         f"""
         SELECT {keys},
                count(*) AS trips,
+               count(DISTINCT vehicle_id) FILTER (WHERE NOT cancelled) AS vehicles_used,
                count(*) FILTER (WHERE outcome = 'cancelled') AS cancelled,
                round(100.0 * count(*) FILTER (WHERE outcome = 'cancelled') / count(*), 1) AS cancelled_pct,
                count(*) FILTER (WHERE outcome IN ('on time', 'late', 'early')) AS measured,
@@ -904,6 +998,76 @@ def query_history(sql: str, start_date: str, end_date: str | None = None, max_ro
             "truncated": len(rows) > cap, "rows": rows[:cap]}
 
 
+
+ALERT_COLUMNS = ["id", "alert_cause", "alert_effect", "alert_header_text_translation",
+                 "alert_description_text_translation", "alert_active_period", "alert_informed_entity"]
+
+
+def alerts_history(start_date: str, end_date: str | None = None, route: str | None = None,
+                   effect: str | None = None, cause: str | None = None, search: str | None = None,
+                   include_description: bool = False, limit: int = 100) -> dict:
+    """Service alerts over a date range from the daily alerts files
+    (YYYY-MM-DD; yesterday and earlier). Each alert appears once, with the
+    days it was seen. Returns counts by effect and by cause, the most affected
+    routes, and the alerts themselves (cause, effect, headline, routes, stops
+    affected, active times). Filters: route ('70'), effect ('NO_SERVICE',
+    'DETOUR', 'STOP_MOVED', 'MODIFIED_SERVICE'...), cause ('CONSTRUCTION',
+    'MAINTENANCE'...), search (words in the headline or description)."""
+    pairs = _history_names(start_date, end_date, kind="alerts")
+    if not pairs:
+        return {"start_date": start_date, "end_date": end_date or start_date, "days_read": 0, "alerts": []}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tables = list(pool.map(_read, [n for _, n in pairs]))
+    merged: dict = {}
+    for (day, _), t in zip(pairs, tables):
+        cols = {c: _str_col(t, c).to_pylist() for c in ALERT_COLUMNS}
+        for i in range(t.num_rows):
+            row = {
+                "id": cols["id"][i], "cause": cols["alert_cause"][i], "effect": cols["alert_effect"][i],
+                "header": cols["alert_header_text_translation"][i],
+                "description": cols["alert_description_text_translation"][i],
+                "active_period": cols["alert_active_period"][i],
+                "informed_entity": cols["alert_informed_entity"][i],
+            }
+            key = row["id"] or f"{day}-{i}"
+            first = merged.get(key, {}).get("first_seen", day)
+            merged[key] = {**row, "first_seen": first, "last_seen": day,
+                           "days_seen": merged.get(key, {}).get("days_seen", 0) + 1}
+    alerts = []
+    words = (search or "").lower().split()
+    for row in merged.values():
+        a = _clean_alert(row, description=True)
+        if effect and (a["effect"] or "").upper() != effect.upper():
+            continue
+        if cause and (a["cause"] or "").upper() != cause.upper():
+            continue
+        if not _route_matches(a["route_ids"], route):
+            continue
+        hay = f"{a['header'] or ''} {a.get('description') or ''}".lower()
+        if words and not all(w in hay for w in words):
+            continue
+        a.update(first_seen=row["first_seen"], last_seen=row["last_seen"], days_seen=row["days_seen"])
+        if not include_description:
+            a.pop("description", None)
+        alerts.append(a)
+    alerts.sort(key=lambda a: (a["first_seen"], a["effect"] or ""), reverse=True)
+
+    def counts(key):
+        c: dict = {}
+        for a in alerts:
+            c[a[key] or "unknown"] = c.get(a[key] or "unknown", 0) + 1
+        return [{key: k, "alerts": v} for k, v in sorted(c.items(), key=lambda kv: -kv[1])]
+
+    route_counts: dict = {}
+    for a in alerts:
+        for r in set(a["routes"]):
+            route_counts[r] = route_counts.get(r, 0) + 1
+    top_routes = [{"route": r, "alerts": n} for r, n in sorted(route_counts.items(), key=lambda kv: -kv[1])[:15]]
+    return {"start_date": pairs[0][0], "end_date": pairs[-1][0], "days_read": len(pairs),
+            "alerts_found": len(alerts), "by_effect": counts("effect"), "by_cause": counts("cause"),
+            "most_affected_routes": top_routes, "alerts": alerts[: max(1, min(limit, 500))]}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -916,8 +1080,9 @@ INSTRUCTIONS = (
     "falling back to vehicle label fleet codes (RT, NB, GB...). Operator filters accept a "
     "code or part of a name. For today and right now use the realtime tools (at_late_trips, "
     "at_whats_running, at_query_feed...). For yesterday and earlier, and any date range "
-    "(this week, this month), use at_performance and at_query_history: they read one "
-    "combined file per day, so they're fast.\n\n" + FEED_COLUMNS_HELP + "\n\n" + TRIPS_COLUMNS_HELP
+    "(this week, this month), use at_performance, at_query_history and at_alerts_history: "
+    "they read one combined file per day, so they're fast. Before making a report or chart, "
+    "call rit_brand for the Ritchies logo and colours.\n\n" + FEED_COLUMNS_HELP + "\n\n" + TRIPS_COLUMNS_HELP
 )
 
 TOOLS = {
@@ -931,6 +1096,7 @@ TOOLS = {
     "at_query_feed": query_feed,
     "at_performance": performance,
     "at_query_history": query_history,
+    "at_alerts_history": alerts_history,
 }
 
 

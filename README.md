@@ -14,46 +14,59 @@ That hosting option is in public preview.
 | Path | What it is |
 | --- | --- |
 | `server.py` | The server: auth, `/health`, `/mcp`. Loads every source. |
-| `sources/at_realtime.py` | AT realtime tools over the data lake |
+| `sources/at_realtime.py` | AT tools over the data lake (realtime and daily history) |
+| `sources/brand.py` | `rit_brand`: Ritchies logo, colours and report rules |
+| `assets/` | Logo files served by `rit_brand` |
 | `sources/__init__.py` | The list of sources |
 | `host.json` | Tells Functions to run `server.py` as an MCP custom handler |
 | `requirements.txt` | Python packages, installed by Functions on deploy |
 | `.vscode/mcp.json` | Connects VS Code to the deployed server and to a local run |
 | `local.settings.json` | Local-only settings (not committed) |
 
-## AT tools
+## Tools
 
 | Tool | What it answers |
 | --- | --- |
+| `rit_brand` | Ritchies logo (as data URIs), colours, fonts, chart and writing rules. AIs call it before making a report |
 | `at_whats_running` | What's running now, split by operator |
 | `at_late_trips` | Late trips now, by route and/or operator |
 | `at_vehicle_positions` | Where vehicles are, by route and/or operator |
-| `at_alerts` | Current service alerts, by route or effect |
-| `at_cancellations` | Cancelled trips for a day, split by operator |
-| `at_on_time_summary` | Punctuality for a day, by route or operator |
-| `at_query_feed` | Anything else: read-only SQL over the `feed` view |
+| `at_alerts` | Service alerts active now: headline, routes, stops affected, active times |
+| `at_cancellations` | Cancelled trips today (or a day), split by operator |
+| `at_on_time_summary` | Punctuality today (or a day) from the minute snapshots |
+| `at_query_feed` | Anything else about today: read-only SQL over the `feed` view |
+| `at_performance` | Any date range (yesterday and earlier): late %, cancelled %, vehicles used, by operator, area, route, day or mode |
+| `at_query_history` | Anything else over a date range: read-only SQL over the `trips` view |
+| `at_alerts_history` | Alerts over a date range: counts by effect and cause, most affected routes, the alerts themselves |
 | `at_describe_feed` | Latest snapshot, operators, and the `feed` columns |
 
 Data:
 
-- Realtime: `ritadlsdevpublic/aucklandtransport/combinefeed/YYYY/MM/DD/HH/combinefeed_MMSS.parquet` (Auckland time, about one a minute).
-- Operators: AT static GTFS in `aucklandtransport/GTFS/`. The server uses the newest `at_gtfs_routes_YYYYMMDD.parquet` and the `at_gtfs_agency_` file of the same date, reloaded every 6 hours. Routes it can't match fall back to vehicle label letters (RT, NB, GB).
-- Day tools (`at_cancellations`, `at_on_time_summary`) read one snapshot every 15 minutes by default, so they're estimates.
-- `at_query_feed` runs in an in-memory DuckDB with file and network access switched off and settings locked.
+- Realtime: `ritadlsdevpublic/aucklandtransport/combinefeed/YYYY/MM/DD/HH/combinefeed_MMSS.parquet` (Auckland time, about one a minute). Used for today.
+- Daily: `combinefeed/YYYY/MM/trip_updates_DD.parquet` (one row per trip, final state) and `alerts_DD.parquet` (one row per alert), written the next morning. Used for yesterday and earlier, so date ranges are cheap.
+- Operators: AT static GTFS in `aucklandtransport/GTFS/`. The server uses the newest `at_gtfs_routes_YYYYMMDD.parquet`, the `at_gtfs_agency_` file of the same date and the newest `at_gtfs_stops_` file, reloaded every 6 hours. Routes it can't match fall back to vehicle label letters (RT, NB, GB).
+- Area (Central, North Shore, West, East, South, Far South, Far North, Islands) is approximate, from stop or vehicle positions.
+- Vehicle positions outside the Auckland region are treated as junk GPS and blanked (`position_valid = false`). About a quarter of reporting vehicles do this, mostly parked ones.
+- "Late" is more than 5 minutes behind at the trip's last reported stop. Arriving early at the end of a route is normal and isn't counted as a failure.
+- Alert text arrives as Python-style text; the server parses it into plain headlines, route lists and times.
+- `at_query_feed` and `at_query_history` run in an in-memory DuckDB with file and network access switched off and settings locked.
+
+## Brand kit
+
+`rit_brand` serves `assets/ritchies-logo.png` and `assets/ritchies-icon.png` as data URIs, plus the colours (blue `#045293`, red `#EE3224`, grey `#9FB3C8` for competitors) and house rules. Change the files or `sources/brand.py` to update it for everyone.
 
 ## Azure setup (Portal)
 
 Function App `rit-mcp`, Flex Consumption, Python 3.12 or 3.13, resource group `RIT-Data-Dev`.
 
 1. **Identity:** system-assigned identity on.
-2. **Data access:** the identity needs **Storage Blob Data Reader** on the `ritadlsdevpublic` storage account. (Assigned by the IT help desk.)
+2. **Data access:** the identity needs **Storage Blob Data Reader** on the `aucklandtransport` container in `ritadlsdevpublic`. (Assigned by the MSP.)
 3. **Environment variables (App settings):**
 
    | Name | Value |
    | --- | --- |
    | `APP_API_TOKEN` | Random string, 32+ characters. Clients send it as a bearer token. |
    | `AzureWebJobsFeatureFlags` | `EnableMcpCustomHandlerPreview` |
-   | `PYTHONPATH` | `/home/site/wwwroot/.python_packages/lib/site-packages` |
 
    Optional: `AT_STORAGE_ACCOUNT`, `AT_CONTAINER` (defaults `ritadlsdevpublic`, `aucklandtransport`).
 4. **Deploy:** in VS Code, Azure Functions extension > Deploy to Function App > `rit-mcp`. Functions installs `requirements.txt` during the deploy.
@@ -71,7 +84,7 @@ Any other MCP client: URL `https://<app-host>/mcp`, header
 
 ## Run locally
 
-Your own account needs Storage Blob Data Reader on the storage account too.
+Your own account needs Storage Blob Data Reader on the container too.
 
 ```
 python -m venv .venv
@@ -82,7 +95,7 @@ python server.py --describe     # checks the feed and GTFS load
 ```
 
 Then either `func start` (uses `local.settings.json`, serves on port 7071) or
-`python server.py` (port 8000, or set `MCP_PORT`; set `APP_API_TOKEN` first). The `rit-mcp-local`
+`python server.py` (port 8000, set `APP_API_TOKEN` first). The `rit-mcp-local`
 entry in `.vscode/mcp.json` points at `func start`.
 
 ## Adding a source
